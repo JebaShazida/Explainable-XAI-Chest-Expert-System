@@ -1,0 +1,2 @@
+# Explainable-XAI-Chest-Expert-System
+In this project deep model is developed using deep models (ResNet-50) integrating with Grad-CAM explainable model and perturbation based LIME model. This project builds diagnostic models that produce explanations usable by clinicians and evaluates those explanations quantitatively and quantitatively.
