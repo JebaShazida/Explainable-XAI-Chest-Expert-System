@@ -1,0 +1,1258 @@
+import os, random, math, csv
+from dataclasses import dataclass
+import numpy as np
+import matplotlib.pyplot as plt
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms, models
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+seed_everything(42)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", device)
+
+print("Versions:")
+print("  numpy:", np.__version__)
+print("  torch:", torch.__version__)
+try:
+    import torchvision
+    print("  torchvision:", torchvision.__version__)
+except Exception as e:
+
+TRAIN_DIR = "/kaggle/input/chexpert/chexpert/train"
+VAL_DIR   = "/kaggle/input/chexpert/chexpert/val"
+TEST_DIR  = "/kaggle/input/chexpert/chexpert/test"
+MASK_ROOT = "/kaggle/input/chexpert/chexpert/masks"  
+BOX_CSV = "/kaggle/input/chexpert/chexpert/boxes.csv"
+CLINICIAN_CSV = "/kaggle/input/chexpert/chexpert/clinician_ratings.csv" 
+
+print("\nTRAIN_DIR exists:", os.path.exists(TRAIN_DIR))
+print("VAL_DIR exists  :", os.path.exists(VAL_DIR))
+print("TEST_DIR exists :", os.path.exists(TEST_DIR))
+
+IMG_SIZE = 224
+
+class ToTensorNoNumpy:
+    """
+    Convert PIL Image -> torch.FloatTensor in [0,1] without calling numpy.
+    Avoids torchvision.transforms.ToTensor torch.from_numpy path.
+    Output: [C,H,W], float32.
+    """
+    def __call__(self, img: Image.Image) -> torch.Tensor:
+        if not isinstance(img, Image.Image):
+            raise TypeError(f"Expected PIL.Image.Image, got {type(img)}")
+
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+
+        w, h = img.size
+        b = img.tobytes()
+
+        if hasattr(torch, "frombuffer"):
+            t = torch.frombuffer(b, dtype=torch.uint8)
+        else:
+            storage = torch.ByteStorage.from_buffer(b)
+            t = torch.ByteTensor(storage)
+
+        t = t.view(h, w, 3).permute(2, 0, 1).contiguous()
+        return t.float().div(255.0)
+
+train_tfms = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.Grayscale(num_output_channels=3),
+    transforms.RandomApply([transforms.ColorJitter(brightness=0.15, contrast=0.15)], p=0.8),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomRotation(7),
+    ToTensorNoNumpy(),
+    transforms.Normalize([0.485,0.456,0.406], [0.229,0.224,0.225]),
+])
+
+val_tfms = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.Grayscale(num_output_channels=3),
+    ToTensorNoNumpy(),
+    transforms.Normalize([0.485,0.456,0.406], [0.229,0.224,0.225]),
+])
+
+inference_tfms = val_tfms  
+
+train_ds = datasets.ImageFolder(TRAIN_DIR, transform=train_tfms)
+val_ds   = datasets.ImageFolder(VAL_DIR,   transform=val_tfms)
+
+if os.path.exists(TEST_DIR):
+    test_ds = datasets.ImageFolder(TEST_DIR, transform=val_tfms)
+else:
+    print("\nWARNING: TEST_DIR not found. Using VAL set as proxy TEST set.")
+    test_ds = val_ds
+
+class_names = train_ds.classes
+num_classes = len(class_names)
+print("\nClasses:", class_names)
+print("Train mapping:", train_ds.class_to_idx)
+
+if val_ds.class_to_idx != train_ds.class_to_idx:
+    print("\nWARNING: train/val class_to_idx differ.")
+if test_ds.class_to_idx != train_ds.class_to_idx:
+    print("\nWARNING: train/test class_to_idx differ.")
+
+targets_np = np.array(train_ds.targets, dtype=np.int64)
+class_counts = np.bincount(targets_np, minlength=num_classes).astype(np.float32)
+print("\nClass counts:", {class_names[i]: int(class_counts[i]) for i in range(num_classes)})
+
+class_weights = class_counts.sum() / (class_counts + 1e-6)
+class_weights = class_weights / class_weights.mean()
+print("Class weights:", {class_names[i]: float(class_weights[i]) for i in range(num_classes)})
+class_weights_t = torch.tensor(class_weights, dtype=torch.float32, device=device)
+
+BATCH_SIZE = 32 if device.type == "cuda" else 16
+EPOCHS = 40
+
+LR = 1e-4
+WEIGHT_DECAY = 1e-5
+SCHEDULER_TYPE = "cosine" 
+
+NUM_WORKERS = 0
+PIN_MEMORY = True
+
+print(f"\nTraining config: bs={BATCH_SIZE}, epochs={EPOCHS}, lr={LR}, wd={WEIGHT_DECAY}, scheduler={SCHEDULER_TYPE}")
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
+
+@dataclass
+class ExperimentConfig:
+    name: str = "resnet50_baseline"
+    backbone: str = "resnet50"  
+    use_attention: bool = False
+    scheduler: str = "cosine"  
+
+def build_backbone(cfg: ExperimentConfig, num_classes: int) -> nn.Module:
+    if cfg.backbone == "resnet18":
+        m = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+    elif cfg.backbone == "resnet34":
+        m = models.resnet34(weights=models.ResNet34_Weights.IMAGENET1K_V1)
+    elif cfg.backbone == "resnet50":
+        m = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+    else:
+        raise ValueError("Unsupported backbone")
+
+    m.fc = nn.Linear(m.fc.in_features, num_classes)
+    return m
+
+CFG = ExperimentConfig(
+    name="resnet50_baseline",
+    backbone="resnet50",
+    use_attention=False,
+    scheduler=SCHEDULER_TYPE.lower(),
+)
+
+model = build_backbone(CFG, num_classes).to(device)
+
+criterion = nn.CrossEntropyLoss(weight=class_weights_t)
+optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+
+if CFG.scheduler == "cosine":
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+elif CFG.scheduler == "step":
+    step_size = max(EPOCHS // 3, 1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=0.1)
+else:
+    raise ValueError("scheduler must be cosine or step")
+
+def confusion_matrix_np(y_true, y_pred, k):
+    cm = np.zeros((k, k), dtype=np.int64)
+    for t, p in zip(y_true, y_pred):
+        cm[int(t), int(p)] += 1
+    return cm
+
+def metrics_from_cm(cm):
+    eps = 1e-12
+    tp = np.diag(cm).astype(np.float64)
+    fp = cm.sum(axis=0).astype(np.float64) - tp
+    fn = cm.sum(axis=1).astype(np.float64) - tp
+    precision = tp / (tp + fp + eps)
+    recall    = tp / (tp + fn + eps)
+    f1        = 2 * precision * recall / (precision + recall + eps)
+    macro_f1  = float(np.mean(f1))
+    return precision, recall, f1, macro_f1
+
+def specificity_from_cm(cm):
+    total = cm.sum()
+    spec = np.zeros(cm.shape[0], dtype=np.float64)
+    for i in range(cm.shape[0]):
+        tp = cm[i, i]
+        fn = cm[i, :].sum() - tp
+        fp = cm[:, i].sum() - tp
+        tn = total - tp - fn - fp
+        spec[i] = tn / (tn + fp + 1e-12)
+    return spec
+
+def roc_auc_binary(y_true01, y_score):
+    y_true01 = np.asarray(y_true01, dtype=np.int64)
+    y_score  = np.asarray(y_score, dtype=np.float64)
+    pos = int((y_true01 == 1).sum())
+    neg = int((y_true01 == 0).sum())
+    if pos == 0 or neg == 0:
+        return np.nan
+    order = np.argsort(-y_score)
+    y = y_true01[order]
+    tp = np.cumsum(y == 1)
+    fp = np.cumsum(y == 0)
+    tpr = tp / (pos + 1e-12)
+    fpr = fp / (neg + 1e-12)
+    tpr = np.concatenate([[0.0], tpr, [1.0]])
+    fpr = np.concatenate([[0.0], fpr, [1.0]])
+    return float(np.trapz(tpr, fpr))
+
+def roc_auc_ovr(y_true, probs, C):
+    aucs = np.zeros(C, dtype=np.float64)
+    for c in range(C):
+        y_bin = (y_true == c).astype(np.int64)
+        aucs[c] = roc_auc_binary(y_bin, probs[:, c])
+    return aucs
+
+def pr_auc_binary(y_true01, y_score):
+    """
+    PR-AUC (Average Precision-ish trapezoid over PR curve), no sklearn.
+    Returns np.nan if only one class present.
+    """
+    y_true01 = np.asarray(y_true01, dtype=np.int64)
+    y_score  = np.asarray(y_score, dtype=np.float64)
+    pos = int((y_true01 == 1).sum())
+    neg = int((y_true01 == 0).sum())
+    if pos == 0 or neg == 0:
+        return np.nan
+
+    order = np.argsort(-y_score)
+    y = y_true01[order]
+
+    tp = np.cumsum(y == 1).astype(np.float64)
+    fp = np.cumsum(y == 0).astype(np.float64)
+
+    precision = tp / (tp + fp + 1e-12)
+    recall    = tp / (pos + 1e-12)
+
+    precision = np.concatenate([[1.0], precision])
+    recall    = np.concatenate([[0.0], recall])
+
+    return float(np.trapz(precision, recall))
+
+def pr_auc_ovr(y_true, probs, C):
+    prs = np.zeros(C, dtype=np.float64)
+    for c in range(C):
+        y_bin = (y_true == c).astype(np.int64)
+        prs[c] = pr_auc_binary(y_bin, probs[:, c])
+    return prs
+
+@torch.no_grad()
+def evaluate_with_probs(model, loader):
+    model.eval()
+    y_true_list = []
+    probs_list  = []
+    total_loss = 0.0
+    n = 0
+
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        logits = model(x)
+        loss = criterion(logits, y)
+        probs = torch.softmax(logits, dim=1)
+
+        total_loss += loss.item() * x.size(0)
+        n += x.size(0)
+
+        y_true_list.extend(y.detach().cpu().tolist())
+        probs_list.extend(probs.detach().cpu().tolist())
+
+    y_true = np.array(y_true_list, dtype=np.int64)
+    probs  = np.array(probs_list, dtype=np.float32)
+    y_pred = probs.argmax(axis=1)
+
+    acc = float((y_true == y_pred).mean())
+    cm = confusion_matrix_np(y_true, y_pred, num_classes)
+
+    prec, rec, f1, macro_f1 = metrics_from_cm(cm)
+    spec = specificity_from_cm(cm)
+
+    aucs = roc_auc_ovr(y_true, probs, num_classes)
+    macro_auc = float(np.nanmean(aucs))
+
+    pr_aucs = pr_auc_ovr(y_true, probs, num_classes)
+    macro_pr = float(np.nanmean(pr_aucs))
+
+    return {
+        "loss": total_loss / max(n, 1),
+        "acc": acc,
+        "cm": cm,
+        "precision": prec,
+        "recall": rec,
+        "specificity": spec,
+        "f1": f1,
+        "macro_f1": macro_f1,
+        "auc_per_class": aucs,
+        "macro_auc": macro_auc,
+        "pr_auc_per_class": pr_aucs,
+        "macro_pr_auc": macro_pr,
+    }
+
+def train_one_epoch(model, loader):
+    model.train()
+    total_loss = 0.0
+    n = 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(x)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * x.size(0)
+        n += x.size(0)
+    return total_loss / max(n, 1)
+
+best_score = -1e9
+os.makedirs("/kaggle/working/checkpoints", exist_ok=True)
+best_path = f"/kaggle/working/checkpoints/best_{CFG.name}.pth"
+
+for epoch in range(1, EPOCHS + 1):
+    tr_loss = train_one_epoch(model, train_loader)
+    val = evaluate_with_probs(model, val_loader)
+
+    scheduler.step()
+    current_lr = optimizer.param_groups[0]["lr"]
+
+    print(f"Epoch {epoch:02d}/{EPOCHS} | lr={current_lr:.6f} | "
+          f"train_loss={tr_loss:.4f} | val_loss={val['loss']:.4f} | "
+          f"val_acc={val['acc']:.4f} | val_macro_f1={val['macro_f1']:.4f} | "
+          f"val_macro_auc={val['macro_auc']:.4f} | val_macro_pr_auc={val['macro_pr_auc']:.4f}")
+
+    score = val["macro_auc"]
+    if np.isnan(score):
+        score = val["acc"]
+
+    if score > best_score:
+        best_score = score
+        torch.save(model.state_dict(), best_path)
+        print("  -> saved best:", best_path)
+
+model.load_state_dict(torch.load(best_path, map_location=device))
+
+def print_eval(prefix, out):
+    print(f"\n=== {prefix} ===")
+    print("Loss:", out["loss"])
+    print("Accuracy:", out["acc"])
+    print("Macro F1:", out["macro_f1"])
+    print("Macro AUROC:", out["macro_auc"])
+    print("Macro PR-AUC:", out["macro_pr_auc"])
+    print("\nConfusion Matrix:\n", out["cm"])
+    print("\nPer-class metrics:")
+    for i, cname in enumerate(class_names):
+        print(f"{cname:15s}  AUROC={out['auc_per_class'][i]:.3f}  PR-AUC={out['pr_auc_per_class'][i]:.3f}  "
+              f"Sens={out['recall'][i]:.3f}  Spec={out['specificity'][i]:.3f}  F1={out['f1'][i]:.3f}")
+
+final_val = evaluate_with_probs(model, val_loader)
+final_test = evaluate_with_probs(model, test_loader)
+print_eval("FINAL VALIDATION (baseline metrics)", final_val)
+print_eval("FINAL TEST (baseline metrics)", final_test)
+
+def denorm_for_vis(x):
+    mean = torch.tensor([0.485,0.456,0.406], device=x.device).view(1,3,1,1)
+    std  = torch.tensor([0.229,0.224,0.225], device=x.device).view(1,3,1,1)
+    return (x * std + mean).clamp(0, 1)
+
+class GradCAMManual:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.activations = None
+        self.gradients = None
+        self.h1 = target_layer.register_forward_hook(self._fwd_hook)
+        self.h2 = target_layer.register_full_backward_hook(self._bwd_hook)
+
+    def _fwd_hook(self, module, inp, out):
+        self.activations = out.detach()
+
+    def _bwd_hook(self, module, grad_in, grad_out):
+        self.gradients = grad_out[0].detach()
+
+    def remove(self):
+        self.h1.remove()
+        self.h2.remove()
+
+    def __call__(self, x, class_idx):
+        self.model.zero_grad(set_to_none=True)
+        logits = self.model(x)
+        score = logits[:, class_idx].sum()
+        score.backward()
+
+        grads = self.gradients
+        acts  = self.activations
+        weights = grads.mean(dim=(2,3), keepdim=True)
+        cam = (weights * acts).sum(dim=1, keepdim=True)
+        cam = F.relu(cam)
+
+        cam = F.interpolate(cam, size=(x.shape[2], x.shape[3]), mode="bilinear", align_corners=False)
+        cam = cam.squeeze(1)
+
+        cam_min = cam.amin(dim=(1,2), keepdim=True)
+        cam_max = cam.amax(dim=(1,2), keepdim=True)
+        cam = (cam - cam_min) / (cam_max - cam_min + 1e-8)
+        return cam.detach()
+
+def load_image_float(img_path):
+    pil = Image.open(img_path).convert("RGB").resize((IMG_SIZE, IMG_SIZE))
+    arr = np.array(pil).astype(np.float32) / 255.0
+    return pil, arr
+
+def grid_segments(h, w, gh=8, gw=8):
+    seg = np.zeros((h, w), dtype=np.int32)
+    sh = h // gh
+    sw = w // gw
+    idx = 0
+    for i in range(gh):
+        for j in range(gw):
+            y0 = i * sh
+            y1 = (i + 1) * sh if i < gh - 1 else h
+            x0 = j * sw
+            x1 = (j + 1) * sw if j < gw - 1 else w
+            seg[y0:y1, x0:x1] = idx
+            idx += 1
+    return seg, idx
+
+def model_predict_proba(imgs_float01, batch_size=32):
+    probs_all = []
+    for i in range(0, len(imgs_float01), batch_size):
+        batch = []
+        for im in imgs_float01[i:i+batch_size]:
+            pil = Image.fromarray((np.clip(im,0,1)*255).astype(np.uint8))
+            t = inference_tfms(pil).unsqueeze(0)
+            batch.append(t)
+        batch = torch.cat(batch, dim=0).to(device)
+        with torch.no_grad():
+            logits = model(batch)
+            probs_list = torch.softmax(logits, dim=1).detach().cpu().tolist()
+            probs_all.append(np.array(probs_list, dtype=np.float32))
+    return np.vstack(probs_all)
+
+def perturb_image(img, segments, mask, hide_color=None):
+    out = img.copy()
+    if hide_color is None:
+        hide_color = img.mean(axis=(0,1), keepdims=True)
+    for seg_id in range(mask.shape[0]):
+        if mask[seg_id] == 0:
+            out[segments == seg_id] = hide_color
+    return out
+
+def weighted_ridge(X, y, w, l2=1.0):
+    Xb = np.concatenate([np.ones((X.shape[0], 1)), X], axis=1)
+    W = np.diag(w.astype(np.float64))
+    A = Xb.T @ W @ Xb
+    reg = np.eye(A.shape[0], dtype=np.float64) * l2
+    reg[0,0] = 0.0
+    A = A + reg
+    b = Xb.T @ W @ y
+    beta = np.linalg.solve(A, b)
+    return beta[0], beta[1:]
+
+def explain_lime_style(img_float, segments, M, class_idx, num_samples=300, kernel_width=0.25, l2=1.0):
+    masks = np.random.randint(0, 2, size=(num_samples, M), dtype=np.int64)
+    masks[0, :] = 1
+    d = (M - masks.sum(axis=1)) / M
+    w = np.exp(-(d**2) / (kernel_width**2))
+    perturbed = [perturb_image(img_float, segments, m) for m in masks]
+    y = model_predict_proba(perturbed)[:, class_idx].astype(np.float64)
+    _, coef = weighted_ridge(masks.astype(np.float64), y, w, l2=l2)
+    return coef
+
+def shap_kernel_weight_logspace(M, k):
+    if k <= 0 or k >= M:
+        return 1e6
+    logC = math.lgamma(M+1) - math.lgamma(k+1) - math.lgamma(M-k+1)
+    logw = math.log(M - 1) - logC - math.log(k) - math.log(M - k)
+    return math.exp(logw)
+
+def explain_kernelshap_style(img_float, segments, M, class_idx, num_samples=300, l2=1e-3):
+    masks = np.random.randint(0, 2, size=(num_samples, M), dtype=np.int64)
+    masks[0, :] = 1
+    k = masks.sum(axis=1)
+    w = np.array([shap_kernel_weight_logspace(M, int(kk)) for kk in k], dtype=np.float64)
+    perturbed = [perturb_image(img_float, segments, m) for m in masks]
+    y = model_predict_proba(perturbed)[:, class_idx].astype(np.float64)
+    _, phi = weighted_ridge(masks.astype(np.float64), y, w, l2=l2)
+    return phi
+
+def coef_to_heatmap_grid(coef, segments):
+    heat = np.zeros_like(segments, dtype=np.float32)
+    for seg_id in range(int(segments.max()+1)):
+        heat[segments == seg_id] = float(coef[seg_id])
+    mn, mx = float(heat.min()), float(heat.max())
+    if mx - mn < 1e-8:
+        return np.zeros_like(heat)
+    return (heat - mn) / (mx - mn)
+
+def threshold_saliency_top_percent(sal, top_percent=0.15):
+    """
+    sal: [H,W] in [0,1] (recommended). Returns binary mask.
+    """
+    s = np.asarray(sal, dtype=np.float32)
+    s = np.clip(s, 0, 1)
+    flat = s.reshape(-1)
+    k = max(1, int(top_percent * flat.size))
+    # threshold at kth largest
+    thr = np.partition(flat, flat.size - k)[flat.size - k]
+    return (s >= thr).astype(np.uint8)
+
+def iou_dice(pred_bin, gt_bin):
+    pred = pred_bin.astype(np.bool_)
+    gt   = gt_bin.astype(np.bool_)
+    inter = np.logical_and(pred, gt).sum()
+    union = np.logical_or(pred, gt).sum()
+    iou = inter / (union + 1e-12)
+    dice = (2 * inter) / (pred.sum() + gt.sum() + 1e-12)
+    return float(iou), float(dice)
+
+def pointing_game(sal, gt_bin):
+    """
+    True if max saliency point falls inside gt region.
+    """
+    s = np.asarray(sal, dtype=np.float32)
+    y, x = np.unravel_index(np.argmax(s), s.shape)
+    return int(gt_bin[y, x] > 0)
+
+def load_mask_for_image(img_path):
+    """
+    Tries to map image path to a corresponding mask under MASK_ROOT.
+    Strategy:
+      - find relative path after TEST_DIR (or VAL_DIR/TRAIN_DIR) and join to MASK_ROOT
+      - try .png/.jpg extensions
+    """
+    if not os.path.exists(MASK_ROOT):
+        return None
+
+    def rel_after(root, path):
+        root = os.path.abspath(root)
+        path = os.path.abspath(path)
+        if path.startswith(root):
+            return os.path.relpath(path, root)
+        return None
+
+    rel = rel_after(TEST_DIR, img_path) or rel_after(VAL_DIR, img_path) or rel_after(TRAIN_DIR, img_path)
+    if rel is None:
+        return None
+
+    base = os.path.join(MASK_ROOT, rel)
+    cand = []
+    cand.append(base)
+    root_noext, _ = os.path.splitext(base)
+    cand.extend([root_noext + ".png", root_noext + ".jpg", root_noext + ".jpeg"])
+
+    for c in cand:
+        if os.path.exists(c):
+            m = Image.open(c).convert("L").resize((IMG_SIZE, IMG_SIZE))
+            arr = (np.array(m) > 0).astype(np.uint8)
+            return arr
+    return None
+
+def load_boxes_csv(csv_path):
+    """
+    Returns dict: image_path -> list of boxes in resized coords (IMG_SIZE space)
+    Boxes expected in original image coords; we will assume they've already been resized
+    or that the images are already IMG_SIZE. If not, you must adapt with original dims.
+    """
+    if not os.path.exists(csv_path):
+        return {}
+    box_map = {}
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            p = r["image_path"]
+            xmin = float(r["xmin"]); ymin = float(r["ymin"]); xmax = float(r["xmax"]); ymax = float(r["ymax"])
+            box_map.setdefault(p, []).append((xmin,ymin,xmax,ymax))
+    return box_map
+
+BOX_MAP = load_boxes_csv(BOX_CSV)
+
+def boxes_to_mask(boxes, H=IMG_SIZE, W=IMG_SIZE):
+    m = np.zeros((H, W), dtype=np.uint8)
+    for (xmin,ymin,xmax,ymax) in boxes:
+        x0 = int(max(0, min(W-1, round(xmin))))
+        x1 = int(max(0, min(W,   round(xmax))))
+        y0 = int(max(0, min(H-1, round(ymin))))
+        y1 = int(max(0, min(H,   round(ymax))))
+        m[y0:y1, x0:x1] = 1
+    return m
+
+def saliency_to_pixel_order(sal):
+    s = np.asarray(sal, dtype=np.float32)
+    flat = s.reshape(-1)
+    order = np.argsort(-flat)  # descending saliency
+    return order
+
+def deletion_insertion_auc(img_float01, sal, class_idx, steps=20, batch_size=16):
+    """
+    Faithfulness:
+      - Deletion: start from original, progressively replace most salient pixels with baseline
+      - Insertion: start from baseline, progressively reveal most salient pixels
+    Returns: del_auc, ins_auc (AUC over probability-vs-step curve, normalized x in [0,1])
+    """
+    img = np.asarray(img_float01, dtype=np.float32)
+    H, W, C = img.shape
+    baseline = img.mean(axis=(0,1), keepdims=True)
+
+    order = saliency_to_pixel_order(sal)
+    N = order.size
+
+    curve_del = []
+    curve_ins = []
+
+    fracs = np.linspace(0.0, 1.0, steps+1)
+    imgs_del = []
+    imgs_ins = []
+
+    base_img = np.broadcast_to(baseline, img.shape).copy()
+
+    for f in fracs:
+        k = int(round(f * N))
+        idx = order[:k]
+
+        im_del = img.copy().reshape(-1, C)
+        im_del[idx] = baseline.reshape(1, C)
+        imgs_del.append(im_del.reshape(H, W, C))
+
+        im_ins = base_img.copy().reshape(-1, C)
+        im_ins[idx] = img.reshape(-1, C)[idx]
+        imgs_ins.append(im_ins.reshape(H, W, C))
+
+    # predict in batches
+    probs_del = model_predict_proba(imgs_del, batch_size=batch_size)[:, class_idx]
+    probs_ins = model_predict_proba(imgs_ins, batch_size=batch_size)[:, class_idx]
+
+    del_auc = float(np.trapz(probs_del, fracs))
+    ins_auc = float(np.trapz(probs_ins, fracs))
+    return del_auc, ins_auc
+
+def _gaussian_kernel_2d(ks=11, sigma=1.5, device="cpu"):
+    ax = torch.arange(ks, device=device).float() - ks//2
+    g = torch.exp(-(ax**2) / (2*sigma**2))
+    g = g / g.sum()
+    k2d = torch.outer(g, g)
+    return k2d
+
+def ssim_map(a, b, ks=11, sigma=1.5):
+    """
+    a,b: [H,W] float32 in [0,1]
+    returns SSIM scalar (mean map)
+    """
+    a = torch.tensor(a, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+    b = torch.tensor(b, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+
+    k = _gaussian_kernel_2d(ks=ks, sigma=sigma, device=device)
+    k = k.unsqueeze(0).unsqueeze(0)
+
+    mu_a = F.conv2d(a, k, padding=ks//2)
+    mu_b = F.conv2d(b, k, padding=ks//2)
+
+    mu_a2 = mu_a * mu_a
+    mu_b2 = mu_b * mu_b
+    mu_ab = mu_a * mu_b
+
+    sig_a2 = F.conv2d(a*a, k, padding=ks//2) - mu_a2
+    sig_b2 = F.conv2d(b*b, k, padding=ks//2) - mu_b2
+    sig_ab = F.conv2d(a*b, k, padding=ks//2) - mu_ab
+
+    C1 = (0.01**2)
+    C2 = (0.03**2)
+
+    ssim = ((2*mu_ab + C1) * (2*sig_ab + C2)) / ((mu_a2 + mu_b2 + C1) * (sig_a2 + sig_b2 + C2) + 1e-12)
+    return float(ssim.mean().detach().cpu().item())
+
+def add_small_noise(img_float01, sigma=0.02):
+    out = img_float01 + np.random.normal(0.0, sigma, size=img_float01.shape).astype(np.float32)
+    return np.clip(out, 0, 1)
+
+def wilcoxon_signed_rank(x, y):
+    """
+    Returns (W, z, p_two_sided). Normal approximation.
+    Tie handling is simplified; adequate for reporting, not publication-grade.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    d = x - y
+    d = d[np.abs(d) > 1e-12]
+    n = d.size
+    if n < 5:
+        return np.nan, np.nan, np.nan
+
+    absd = np.abs(d)
+    ranks = absd.argsort().argsort().astype(np.float64) + 1.0  
+    Wpos = ranks[d > 0].sum()
+    Wneg = ranks[d < 0].sum()
+    W = min(Wpos, Wneg)
+
+    mu = n*(n+1)/4.0
+    sigma = math.sqrt(n*(n+1)*(2*n+1)/24.0 + 1e-12)
+    z = (W - mu) / sigma
+
+    Phi = 0.5 * (1.0 + math.erf(abs(z)/math.sqrt(2.0)))
+    p = 2.0 * (1.0 - Phi)
+    return float(W), float(z), float(p)
+
+EXPLAIN_DIR = "/kaggle/working/test_explanations_full"
+os.makedirs(EXPLAIN_DIR, exist_ok=True)
+
+N_EXPLAIN = 20            
+NUM_SAMPLES_PERT = 200   
+GRID_GH, GRID_GW = 8, 8
+
+TOP_PERCENT = 0.15
+
+FAITH_STEPS = 20
+FAITH_BATCH = 16
+
+NOISE_SIGMA = 0.02
+
+print("\nGenerating explanations + evaluating on", min(N_EXPLAIN, len(test_ds)), "test images...")
+print("Saving to:", EXPLAIN_DIR)
+
+rows = []
+del_auc_by_method = {"gradcam": [], "lime": [], "shap": []}
+ins_auc_by_method = {"gradcam": [], "lime": [], "shap": []}
+iou_by_method     = {"gradcam": [], "lime": [], "shap": []}
+dice_by_method    = {"gradcam": [], "lime": [], "shap": []}
+pg_by_method      = {"gradcam": [], "lime": [], "shap": []}
+ssim_by_method    = {"gradcam": [], "lime": [], "shap": []}
+
+def normalize01(a):
+    a = np.asarray(a, dtype=np.float32)
+    a = np.nan_to_num(a, nan=0.0, posinf=1.0, neginf=0.0)
+    mn, mx = float(a.min()), float(a.max())
+    if mx - mn < 1e-8:
+        return np.zeros_like(a)
+    return (a - mn) / (mx - mn)
+
+def cam_for_image_tensor(x, class_idx):
+    cam_engine = GradCAMManual(model, model.layer4[-1])
+    cam_map_t = cam_engine(x, class_idx)[0].detach().cpu()
+    cam_engine.remove()
+    return normalize01(np.array(cam_map_t.tolist(), dtype=np.float32))
+
+def explain_all_methods(img_path, x_tensor, pred_class):
+    """
+    Returns dict of saliency maps in [0,1], each [H,W]
+    """
+    cam_map = cam_for_image_tensor(x_tensor, pred_class)
+
+    _, img_float = load_image_float(img_path) 
+    H, W, _ = img_float.shape
+    segments, M = grid_segments(H, W, gh=GRID_GH, gw=GRID_GW)
+
+    lime_coef = explain_lime_style(img_float, segments, M, pred_class, num_samples=NUM_SAMPLES_PERT)
+    shap_phi  = explain_kernelshap_style(img_float, segments, M, pred_class, num_samples=NUM_SAMPLES_PERT)
+
+    lime_heat = normalize01(coef_to_heatmap_grid(lime_coef, segments))
+    shap_heat = normalize01(coef_to_heatmap_grid(shap_phi, segments))
+
+    return img_float, {"gradcam": cam_map, "lime": lime_heat, "shap": shap_heat}
+
+def get_gt_mask(img_path):
+    """
+    Priority:
+      1) mask file under MASK_ROOT
+      2) boxes from BOX_CSV
+      else None
+    """
+    m = load_mask_for_image(img_path)
+    if m is not None:
+        return m
+
+    if img_path in BOX_MAP:
+        return boxes_to_mask(BOX_MAP[img_path], H=IMG_SIZE, W=IMG_SIZE)
+
+    return None
+
+def overlay_and_save(img_float, maps, title, out_path):
+    plt.figure(figsize=(16,4))
+    plt.subplot(1,4,1); plt.imshow(img_float); plt.title("Input"); plt.axis("off")
+    plt.subplot(1,4,2); plt.imshow(img_float); plt.imshow(maps["gradcam"], cmap="jet", alpha=0.45); plt.title("Grad-CAM"); plt.axis("off")
+    plt.subplot(1,4,3); plt.imshow(img_float); plt.imshow(maps["lime"], cmap="jet", alpha=0.45); plt.title("LIME-style"); plt.axis("off")
+    plt.subplot(1,4,4); plt.imshow(img_float); plt.imshow(maps["shap"], cmap="jet", alpha=0.45); plt.title("KernelSHAP-style"); plt.axis("off")
+    plt.suptitle(title, y=1.05)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+def randomize_model_weights_inplace(m):
+    """
+    Sanity check: randomize weights (re-init) for degradation.
+    We keep architecture but reset parameters.
+    """
+    for mod in m.modules():
+        if isinstance(mod, (nn.Conv2d, nn.Linear)):
+            nn.init.kaiming_normal_(mod.weight, nonlinearity="relu")
+            if mod.bias is not None:
+                nn.init.zeros_(mod.bias)
+        elif isinstance(mod, (nn.BatchNorm2d, nn.GroupNorm)):
+            if mod.weight is not None:
+                nn.init.ones_(mod.weight)
+            if mod.bias is not None:
+                nn.init.zeros_(mod.bias)
+
+def corrcoef(a, b):
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    a = a - a.mean()
+    b = b - b.mean()
+    denom = (np.sqrt((a*a).sum()) * np.sqrt((b*b).sum()) + 1e-12)
+    return float((a*b).sum() / denom)
+
+sanity_model = build_backbone(CFG, num_classes).to(device)
+sanity_model.load_state_dict(torch.load(best_path, map_location=device))
+randomize_model_weights_inplace(sanity_model)
+sanity_model.eval()
+
+def gradcam_on_model(m, x_tensor, class_idx):
+    cam_engine = GradCAMManual(m, m.layer4[-1])
+    cam_map_t = cam_engine(x_tensor, class_idx)[0].detach().cpu()
+    cam_engine.remove()
+    return normalize01(np.array(cam_map_t.tolist(), dtype=np.float32))
+
+for idx in range(min(N_EXPLAIN, len(test_ds))):
+    img_tensor, true_label = test_ds[idx]
+    x = img_tensor.unsqueeze(0).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        logits = model(x)
+        probs_t = torch.softmax(logits, dim=1)[0]
+        pred_class = int(probs_t.argmax().item())
+        pred_prob  = float(probs_t[pred_class].item())
+
+    img_path, _ = test_ds.samples[idx]
+    img_float, maps = explain_all_methods(img_path, x, pred_class)
+
+    gt_mask = get_gt_mask(img_path)
+
+    for method, sal in maps.items():
+        iou = dice = pg = np.nan
+        if gt_mask is not None:
+            pred_bin = threshold_saliency_top_percent(sal, top_percent=TOP_PERCENT)
+            iou, dice = iou_dice(pred_bin, gt_mask)
+            pg = pointing_game(sal, gt_mask)
+
+            iou_by_method[method].append(iou)
+            dice_by_method[method].append(dice)
+            pg_by_method[method].append(pg)
+        del_auc, ins_auc = deletion_insertion_auc(img_float, sal, pred_class, steps=FAITH_STEPS, batch_size=FAITH_BATCH)
+        del_auc_by_method[method].append(del_auc)
+        ins_auc_by_method[method].append(ins_auc)
+        img_noisy = add_small_noise(img_float, sigma=NOISE_SIGMA)
+        if method == "gradcam":
+            pil = Image.fromarray((img_noisy*255).astype(np.uint8))
+            x_noisy = inference_tfms(pil).unsqueeze(0).to(device)
+            sal_noisy = cam_for_image_tensor(x_noisy, pred_class)
+        else:
+            H, W, _ = img_noisy.shape
+            segments, M = grid_segments(H, W, gh=GRID_GH, gw=GRID_GW)
+            if method == "lime":
+                coef = explain_lime_style(img_noisy, segments, M, pred_class, num_samples=NUM_SAMPLES_PERT)
+                sal_noisy = normalize01(coef_to_heatmap_grid(coef, segments))
+            else:
+                phi  = explain_kernelshap_style(img_noisy, segments, M, pred_class, num_samples=NUM_SAMPLES_PERT)
+                sal_noisy = normalize01(coef_to_heatmap_grid(phi, segments))
+
+        ssim_val = ssim_map(sal, sal_noisy)
+        ssim_by_method[method].append(ssim_val)
+
+        rows.append({
+            "idx": idx,
+            "image_path": img_path,
+            "true_label": class_names[int(true_label)],
+            "pred_label": class_names[int(pred_class)],
+            "pred_prob": pred_prob,
+            "method": method,
+            "iou": iou,
+            "dice": dice,
+            "pointing_game": pg,
+            "del_auc": del_auc,
+            "ins_auc": ins_auc,
+            "ssim_noise": ssim_val,
+        })
+
+    cam_clean = maps["gradcam"]
+    with torch.enable_grad(): 
+        cam_rand = gradcam_on_model(sanity_model, x, pred_class)
+        sanity_corr = corrcoef(cam_clean, cam_rand)
+
+    out_path = os.path.join(
+        EXPLAIN_DIR,
+        f"test_{idx:04d}_true_{class_names[int(true_label)]}_pred_{class_names[pred_class]}_{pred_prob:.3f}.png"
+    )
+    overlay_and_save(
+        img_float,
+        maps,
+        title=f"True={class_names[int(true_label)]} | Pred={class_names[pred_class]} ({pred_prob:.3f}) | SanityCorr(GradCAM vs Rand)={sanity_corr:.3f}",
+        out_path=out_path
+    )
+
+print("\nDone. Explanation overlays saved to:", EXPLAIN_DIR)
+
+metrics_csv = os.path.join(EXPLAIN_DIR, "explanation_metrics.csv")
+with open(metrics_csv, "w", newline="") as f:
+    fieldnames = list(rows[0].keys()) if len(rows) else []
+    w = csv.DictWriter(f, fieldnames=fieldnames)
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+print("Saved explanation metrics to:", metrics_csv)
+
+def safe_mean(xs):
+    xs = [x for x in xs if x is not None and not (isinstance(x, float) and np.isnan(x))]
+    return float(np.mean(xs)) if len(xs) else np.nan
+
+print("\n=== Explanation Metric Summary (means) ===")
+for m in ["gradcam", "lime", "shap"]:
+    print(f"\nMethod: {m}")
+    if len(iou_by_method[m]) > 0:
+        print("  IoU mean:", safe_mean(iou_by_method[m]))
+        print("  Dice mean:", safe_mean(dice_by_method[m]))
+        print("  PointingGame mean:", safe_mean(pg_by_method[m]))
+    else:
+        print("  IoU/Dice/PointingGame: (skipped) no GT masks/boxes found")
+    print("  Deletion AUC mean:", safe_mean(del_auc_by_method[m]))
+    print("  Insertion AUC mean:", safe_mean(ins_auc_by_method[m]))
+    print("  SSIM under noise mean:", safe_mean(ssim_by_method[m]))
+
+def pairwise_wilcoxon(metric_by_method, metric_name):
+    pairs = [("gradcam","lime"), ("gradcam","shap"), ("lime","shap")]
+    print(f"\n=== Wilcoxon (approx) on {metric_name} ===")
+    for a,b in pairs:
+        xa = np.array(metric_by_method[a], dtype=np.float64)
+        xb = np.array(metric_by_method[b], dtype=np.float64)
+        n = min(len(xa), len(xb))
+        if n < 5:
+            print(f"  {a} vs {b}: not enough paired samples (n={n})")
+            continue
+        W,z,p = wilcoxon_signed_rank(xa[:n], xb[:n])
+        print(f"  {a} vs {b}: n={n}  W={W:.2f}  z={z:.3f}  p≈{p:.4g}")
+
+pairwise_wilcoxon(del_auc_by_method, "Deletion AUC (lower usually better)")
+pairwise_wilcoxon(ins_auc_by_method, "Insertion AUC (higher usually better)")
+pairwise_wilcoxon(ssim_by_method, "SSIM under noise (higher = more robust)")
+
+# Only if GT exists:
+if len(iou_by_method["gradcam"]) > 0:
+    pairwise_wilcoxon(iou_by_method, "IoU")
+    pairwise_wilcoxon(dice_by_method, "Dice")
+    pairwise_wilcoxon(pg_by_method, "Pointing Game")
+
+def summarize_clinician_csv(path):
+    if not os.path.exists(path):
+        print("\nClinician CSV not found; skipping:", path)
+        return
+    rows = []
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append(r)
+
+    if not rows:
+        print("\nClinician CSV is empty:", path)
+        return
+
+    def to_float(v):
+        try:
+            return float(v)
+        except:
+            return np.nan
+
+    methods = sorted(set(r.get("method","") for r in rows))
+    print("\n=== Clinician Study Summary (Likert means) ===")
+    for m in methods:
+        ms = [r for r in rows if r.get("method","") == m]
+        u = [to_float(r.get("score_usefulness","")) for r in ms]
+        rel = [to_float(r.get("score_relevance","")) for r in ms]
+        tr = [to_float(r.get("score_trust","")) for r in ms]
+        rk = [to_float(r.get("rank","")) for r in ms]
+        print(f"\nMethod: {m}")
+        print("  usefulness mean:", safe_mean(u))
+        print("  relevance  mean:", safe_mean(rel))
+        print("  trust      mean:", safe_mean(tr))
+        print("  rank mean (lower better):", safe_mean(rk))
+
+summarize_clinician_csv(CLINICIAN_CSV)
+
+print("\nAll done.")
+
+
+
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+def roc_curve_binary(y_true01, y_score):
+    """
+    Returns fpr, tpr arrays for ROC curve (binary), no sklearn.
+    y_true01: 0/1 array
+    y_score : float scores
+    """
+    y_true01 = np.asarray(y_true01, dtype=np.int64)
+    y_score  = np.asarray(y_score, dtype=np.float64)
+
+    pos = int((y_true01 == 1).sum())
+    neg = int((y_true01 == 0).sum())
+    if pos == 0 or neg == 0:
+        return None, None
+
+    order = np.argsort(-y_score)
+    y = y_true01[order]
+    tp = np.cumsum(y == 1).astype(np.float64)
+    fp = np.cumsum(y == 0).astype(np.float64)
+
+    tpr = tp / (pos + 1e-12)
+    fpr = fp / (neg + 1e-12)
+
+    tpr = np.concatenate([[0.0], tpr, [1.0]])
+    fpr = np.concatenate([[0.0], fpr, [1.0]])
+    return fpr, tpr
+
+def pr_curve_binary(y_true01, y_score):
+    """
+    Returns recall, precision arrays for PR curve (binary), no sklearn.
+    """
+    y_true01 = np.asarray(y_true01, dtype=np.int64)
+    y_score  = np.asarray(y_score, dtype=np.float64)
+
+    pos = int((y_true01 == 1).sum())
+    neg = int((y_true01 == 0).sum())
+    if pos == 0 or neg == 0:
+        return None, None
+
+    order = np.argsort(-y_score)
+    y = y_true01[order]
+    tp = np.cumsum(y == 1).astype(np.float64)
+    fp = np.cumsum(y == 0).astype(np.float64)
+
+    precision = tp / (tp + fp + 1e-12)
+    recall    = tp / (pos + 1e-12)
+
+    precision = np.concatenate([[1.0], precision])
+    recall    = np.concatenate([[0.0], recall])
+    return recall, precision
+
+def roc_auc_binary_local(y_true01, y_score):
+    """
+    Computes AUROC using trapezoid on ROC curve (binary), no sklearn.
+    """
+    fpr, tpr = roc_curve_binary(y_true01, y_score)
+    if fpr is None:
+        return np.nan
+    return float(np.trapz(tpr, fpr))
+
+def pr_auc_binary_local(y_true01, y_score):
+    """
+    Computes PR-AUC using trapezoid on PR curve (binary), no sklearn.
+    """
+    rec, prec = pr_curve_binary(y_true01, y_score)
+    if rec is None:
+        return np.nan
+    return float(np.trapz(prec, rec))
+
+def plot_confusion_matrix(cm, class_names, title, save_path, normalize=False):
+    cm = np.asarray(cm, dtype=np.float64)
+
+    if normalize:
+        row_sums = cm.sum(axis=1, keepdims=True) + 1e-12
+        cm_disp = cm / row_sums
+    else:
+        cm_disp = cm
+
+    fig = plt.figure(figsize=(7,6))
+    plt.imshow(cm_disp, interpolation="nearest")
+    plt.title(title + (" (normalized)" if normalize else ""))
+    plt.colorbar()
+
+    ticks = np.arange(len(class_names))
+    plt.xticks(ticks, class_names, rotation=45, ha="right")
+    plt.yticks(ticks, class_names)
+
+    thresh = cm_disp.max() * 0.6 if cm_disp.max() > 0 else 0
+    for i in range(cm_disp.shape[0]):
+        for j in range(cm_disp.shape[1]):
+            val = cm_disp[i, j]
+            text = f"{val:.2f}" if normalize else f"{int(cm[i, j])}"
+            plt.text(j, i, text,
+                     ha="center", va="center",
+                     color="white" if val > thresh else "black")
+
+    plt.ylabel("True label")
+    plt.xlabel("Predicted label")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+def plot_roc_ovr(y_true, probs, class_names, title, save_path):
+    y_true = np.asarray(y_true, dtype=np.int64)
+    probs  = np.asarray(probs, dtype=np.float32)
+    C = probs.shape[1]
+
+    fig = plt.figure(figsize=(8,6))
+
+    aucs = []
+    plotted = 0
+    for c in range(C):
+        y_bin = (y_true == c).astype(np.int64)
+        fpr, tpr = roc_curve_binary(y_bin, probs[:, c])
+        if fpr is None:
+            continue
+        auc_c = roc_auc_binary_local(y_bin, probs[:, c])
+        aucs.append(auc_c)
+        plt.plot(fpr, tpr, label=f"{class_names[c]} (AUC={auc_c:.3f})")
+        plotted += 1
+
+    plt.plot([0,1],[0,1], linestyle="--", label="Chance")
+    macro_auc = float(np.nanmean(np.array(aucs))) if len(aucs) else float("nan")
+    plt.title(f"{title}\nMacro AUROC={macro_auc:.3f} | curves={plotted}/{C}")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.legend(loc="lower right", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+def plot_pr_ovr(y_true, probs, class_names, title, save_path):
+    y_true = np.asarray(y_true, dtype=np.int64)
+    probs  = np.asarray(probs, dtype=np.float32)
+    C = probs.shape[1]
+
+    fig = plt.figure(figsize=(8,6))
+
+    pr_aucs = []
+    plotted = 0
+    for c in range(C):
+        y_bin = (y_true == c).astype(np.int64)
+        rec, prec = pr_curve_binary(y_bin, probs[:, c])
+        if rec is None:
+            continue
+        pr_auc_c = pr_auc_binary_local(y_bin, probs[:, c])
+        pr_aucs.append(pr_auc_c)
+        plt.plot(rec, prec, label=f"{class_names[c]} (PR-AUC={pr_auc_c:.3f})")
+        plotted += 1
+
+    macro_pr = float(np.nanmean(np.array(pr_aucs))) if len(pr_aucs) else float("nan")
+    plt.title(f"{title}\nMacro PR-AUC={macro_pr:.3f} | curves={plotted}/{C}")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.legend(loc="lower left", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+
+
+
+PLOT_DIR = "/kaggle/working/plots"
+os.makedirs(PLOT_DIR, exist_ok=True)
+
+def ensure_ytrue_probs(eval_dict, loader_name="test_loader"):
+    """
+    Your current evaluate_with_probs() doesn't return y_true/probs.
+    If y_true/probs are missing, we recompute them here using the trained 'model'.
+    This does NOT change your training code.
+    """
+    if ("y_true" in eval_dict) and ("probs" in eval_dict):
+        return eval_dict["y_true"], eval_dict["probs"]
+
+    if loader_name == "test_loader":
+        loader = test_loader
+    else:
+        loader = val_loader
+
+    y_true_list = []
+    probs_list  = []
+
+    model.eval()
+    with torch.no_grad():
+        for x, y in loader:
+            x = x.to(device)
+            logits = model(x)
+            probs = torch.softmax(logits, dim=1)
+
+            y_true_list.extend(y.cpu().numpy().tolist())
+            probs_list.extend(probs.cpu().numpy().tolist())
+
+    y_true = np.array(y_true_list, dtype=np.int64)
+    probs  = np.array(probs_list, dtype=np.float32)
+    return y_true, probs
+
+# --- TEST plots ---
+y_true_test, probs_test = ensure_ytrue_probs(final_test, "test_loader")
+cm_test = final_test["cm"]
+
+plot_confusion_matrix(
+    cm_test, class_names,
+    title="Confusion Matrix (Test)",
+    save_path=os.path.join(PLOT_DIR, "confusion_matrix_test.png"),
+    normalize=False
+)
+
+plot_confusion_matrix(
+    cm_test, class_names,
+    title="Confusion Matrix (Test)",
+    save_path=os.path.join(PLOT_DIR, "confusion_matrix_test_normalized.png"),
+    normalize=True
+)
+
+plot_roc_ovr(
+    y_true_test, probs_test, class_names,
+    title="ROC Curves (OvR, Test)",
+    save_path=os.path.join(PLOT_DIR, "roc_ovr_test.png")
+)
+
+plot_pr_ovr(
+    y_true_test, probs_test, class_names,
+    title="PR Curves (OvR, Test)",
+    save_path=os.path.join(PLOT_DIR, "pr_ovr_test.png")
+)
+
+print("Saved TEST plots to:", PLOT_DIR)
+print(" - confusion_matrix_test.png")
+print(" - confusion_matrix_test_normalized.png")
+print(" - roc_ovr_test.png")
+print(" - pr_ovr_test.png")
+y_true_val, probs_val = ensure_ytrue_probs(final_val, "val_loader")
+cm_val = final_val["cm"]
+
+plot_confusion_matrix(
+    cm_val, class_names,
+    title="Confusion Matrix (Val)",
+    save_path=os.path.join(PLOT_DIR, "confusion_matrix_val.png"),
+    normalize=False
+)
+
+plot_roc_ovr(
+    y_true_val, probs_val, class_names,
+    title="ROC Curves (OvR, Val)",
+    save_path=os.path.join(PLOT_DIR, "roc_ovr_val.png")
+)
+
+plot_pr_ovr(
+    y_true_val, probs_val, class_names,
+    title="PR Curves (OvR, Val)",
+    save_path=os.path.join(PLOT_DIR, "pr_ovr_val.png")
+)
+
+print("Saved VAL plots too.")
